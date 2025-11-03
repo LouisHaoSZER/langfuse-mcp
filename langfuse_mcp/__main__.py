@@ -9,7 +9,6 @@ import inspect
 import json
 import logging
 import os
-import sys
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -24,14 +23,10 @@ from typing import Annotated, Any, Literal, cast
 
 from cachetools import LRUCache
 
-if sys.version_info >= (3, 14):
-    raise SystemExit(
-        "langfuse-mcp currently requires Python 3.13 or earlier. "
-        "Please rerun with `uvx --python 3.13 langfuse-mcp` or pin a supported interpreter."
-    )
 
 from langfuse import Langfuse
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
+from fastmcp.tools import Tool
 from pydantic import AfterValidator, BaseModel, Field
 
 try:
@@ -205,6 +200,9 @@ def _read_env_defaults() -> dict[str, Any]:
         "host": os.getenv("LANGFUSE_HOST") or "https://cloud.langfuse.com",
         "log_level": os.getenv("LANGFUSE_LOG_LEVEL", "INFO"),
         "log_to_console": os.getenv("LANGFUSE_LOG_TO_CONSOLE", "").lower() in {"1", "true", "yes"},
+        "transport": os.getenv("LANGFUSE_MCP_TRANSPORT", "stdio"),
+        "sse_host": os.getenv("LANGFUSE_MCP_SSE_HOST", "127.0.0.1"),
+        "sse_port": int(os.getenv("LANGFUSE_MCP_SSE_PORT", "8000")),
     }
 
 
@@ -231,9 +229,7 @@ def _build_arg_parser(env_defaults: dict[str, Any]) -> argparse.ArgumentParser:
         "--dump-dir",
         type=str,
         default="/tmp/langfuse_mcp_dumps",
-        help=(
-            "Directory to save full JSON dumps when 'output_mode' is 'full_json_file'. The directory will be created if it doesn't exist."
-        ),
+        help=("Directory to save full JSON dumps when 'output_mode' is 'full_json_file'. The directory will be created if it doesn't exist."),
     )
     parser.add_argument(
         "--log-level",
@@ -253,6 +249,25 @@ def _build_arg_parser(env_defaults: dict[str, Any]) -> argparse.ArgumentParser:
         action="store_false",
         dest="log_to_console",
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--transport",
+        type=str,
+        default=env_defaults["transport"],
+        choices=["stdio", "sse"],
+        help="Transport protocol to use: 'stdio' (default) or 'sse' (Server-Sent Events)",
+    )
+    parser.add_argument(
+        "--sse-host",
+        type=str,
+        default=env_defaults["sse_host"],
+        help="Host address for SSE transport (default: 127.0.0.1). Only used when --transport=sse",
+    )
+    parser.add_argument(
+        "--sse-port",
+        type=int,
+        default=env_defaults["sse_port"],
+        help="Port number for SSE transport (default: 8000). Only used when --transport=sse",
     )
 
     return parser
@@ -798,9 +813,7 @@ class MCPState:
     exceptions_by_filepath: LRUCache = field(
         default_factory=lambda: LRUCache(maxsize=100), metadata={"description": "Mapping of file paths to exception details"}
     )
-    dump_dir: str = field(
-        default=None, metadata={"description": "Directory to save full JSON dumps when 'output_mode' is 'full_json_file'"}
-    )
+    dump_dir: str = field(default=None, metadata={"description": "Directory to save full JSON dumps when 'output_mode' is 'full_json_file'"})
 
 
 class ExceptionCount(BaseModel):
@@ -862,9 +875,7 @@ def _get_cached_observation(langfuse_client: Langfuse, observation_id: str) -> A
         return None
 
 
-async def _efficient_fetch_observations(
-    state: MCPState, from_timestamp: datetime, to_timestamp: datetime, filepath: str = None
-) -> dict[str, Any]:
+async def _efficient_fetch_observations(state: MCPState, from_timestamp: datetime, to_timestamp: datetime, filepath: str = None) -> dict[str, Any]:
     """Efficiently fetch observations with exception filtering.
 
     Args:
@@ -1230,10 +1241,10 @@ async def fetch_trace(
 
 async def fetch_observations(
     ctx: Context,
+    age: ValidatedAge = Field(..., description="Minutes ago to start looking (e.g., 1440 for 24 hours)"),
     type: Literal["SPAN", "GENERATION", "EVENT"] | None = Field(
         None, description="The observation type to filter by ('SPAN', 'GENERATION', or 'EVENT')"
     ),
-    age: ValidatedAge = Field(..., description="Minutes ago to start looking (e.g., 1440 for 24 hours)"),
     name: str | None = Field(None, description="Optional name filter (string pattern to match)"),
     user_id: str | None = Field(None, description="Optional user ID filter (exact match)"),
     trace_id: str | None = Field(None, description="Optional trace ID filter (exact match)"),
@@ -1254,8 +1265,8 @@ async def fetch_observations(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
-        type: The observation type to filter by (SPAN, GENERATION, or EVENT)
         age: Minutes ago to start looking (e.g., 1440 for 24 hours)
+        type: The observation type to filter by (SPAN, GENERATION, or EVENT)
         name: Optional name filter (string pattern to match)
         user_id: Optional user ID filter (exact match)
         trace_id: Optional trace ID filter (exact match)
@@ -1689,8 +1700,7 @@ async def get_user_sessions(
         processed_sessions, file_meta = process_data_with_mode(sessions, mode, f"user_{user_id}_sessions", state)
 
         logger.info(
-            f"Found {len(sessions)} sessions for user {user_id}, returning with output_mode={mode}, "
-            f"include_observations={include_observations}"
+            f"Found {len(sessions)} sessions for user {user_id}, returning with output_mode={mode}, " f"include_observations={include_observations}"
         )
 
         if mode == OutputMode.FULL_JSON_STRING:
@@ -1717,14 +1727,10 @@ async def get_user_sessions(
 
 async def find_exceptions(
     ctx: Context,
-    age: ValidatedAge = Field(
-        ..., description="Number of minutes to look back (positive integer, max 7 days/10080 minutes)", gt=0, le=7 * DAY
-    ),
+    age: ValidatedAge = Field(..., description="Number of minutes to look back (positive integer, max 7 days/10080 minutes)", gt=0, le=7 * DAY),
     group_by: Literal["file", "function", "type"] = Field(
         "file",
-        description=(
-            "How to group exceptions - 'file' groups by filename, 'function' groups by function name, or 'type' groups by exception type"
-        ),
+        description=("How to group exceptions - 'file' groups by filename, 'function' groups by function name, or 'type' groups by exception type"),
     ),
 ) -> ResponseDict:
     """Get exception counts grouped by file path, function, or type.
@@ -1809,9 +1815,7 @@ async def find_exceptions(
 async def find_exceptions_in_file(
     ctx: Context,
     filepath: str = Field(..., description="Path to the file to search for exceptions (full path including extension)"),
-    age: ValidatedAge = Field(
-        ..., description="Number of minutes to look back (positive integer, max 7 days/10080 minutes)", gt=0, le=7 * DAY
-    ),
+    age: ValidatedAge = Field(..., description="Number of minutes to look back (positive integer, max 7 days/10080 minutes)", gt=0, le=7 * DAY),
     output_mode: OUTPUT_MODE_LITERAL = Field(
         OutputMode.COMPACT,
         description=(
@@ -2064,9 +2068,7 @@ async def get_exception_details(
 
 async def get_error_count(
     ctx: Context,
-    age: ValidatedAge = Field(
-        ..., description="Number of minutes to look back (positive integer, max 7 days/10080 minutes)", gt=0, le=7 * DAY
-    ),
+    age: ValidatedAge = Field(..., description="Number of minutes to look back (positive integer, max 7 days/10080 minutes)", gt=0, le=7 * DAY),
 ) -> ResponseDict:
     """Get number of traces with exceptions in last N minutes.
 
@@ -2132,8 +2134,7 @@ async def get_error_count(
         }
 
         logger.info(
-            f"Found {total_exceptions} exceptions in {observations_with_exceptions} observations across "
-            f"{len(trace_ids_with_exceptions)} traces"
+            f"Found {total_exceptions} exceptions in {observations_with_exceptions} observations across " f"{len(trace_ids_with_exceptions)} traces"
         )
         return {"data": result, "metadata": {"file_path": None, "file_info": None}}
     except Exception as e:
@@ -2237,7 +2238,7 @@ Scores are evaluations attached to traces or observations.
 ```
 {
   "id": "string",             // Unique identifier
-  "name": "string",           // Score name 
+  "name": "string",           // Score name
   "value": "number or string", // Score value (numeric or categorical)
   "data_type": "string",      // NUMERIC, BOOLEAN, or CATEGORICAL
   "trace_id": "string",       // Associated trace
@@ -2251,116 +2252,132 @@ Scores are evaluations attached to traces or observations.
     return schema
 
 
-def app_factory(public_key: str, secret_key: str, host: str, cache_size: int = 100, dump_dir: str = None) -> FastMCP:
-    """Create a FastMCP server with Langfuse tools.
+# Setup lifespan context for Langfuse state if not already set
+@asynccontextmanager
+async def langfuse_lifespan(
+    cache_size: int, dump_dir: str | None = None, public_key: str | None = None, secret_key: str | None = None, host: str | None = None
+) -> AsyncIterator[MCPState]:
+    """Initialize and cleanup MCP server state for Langfuse."""
+    init_params = inspect.signature(Langfuse.__init__).parameters
+    langfuse_kwargs = {
+        "public_key": public_key,
+        "secret_key": secret_key,
+        "host": host,
+        "debug": False,
+        "flush_at": 0,
+        "flush_interval": None,
+    }
+    if "tracing_enabled" in init_params:
+        langfuse_kwargs["tracing_enabled"] = False  # type: ignore[assignment]
+    state = MCPState(
+        langfuse_client=Langfuse(**langfuse_kwargs),
+        observation_cache=LRUCache(maxsize=cache_size),
+        file_to_observations_map=LRUCache(maxsize=cache_size),
+        exception_type_map=LRUCache(maxsize=cache_size),
+        exceptions_by_filepath=LRUCache(maxsize=cache_size),
+        dump_dir=dump_dir or None,
+    )
+    try:
+        yield state
+    finally:
+        logger.info("Cleaning up Langfuse client")
+        state.langfuse_client.flush()
+        state.langfuse_client.shutdown()
+
+
+def register_langfuse_tools(
+    mcp_server: FastMCP,
+) -> None:
+    """Register Langfuse tools to an existing FastMCP server.
 
     Args:
-        public_key: Langfuse public key
-        secret_key: Langfuse secret key
-        host: Langfuse API host URL
-        cache_size: Size of LRU caches used for caching data
-        dump_dir: Directory to save full JSON dumps when 'output_mode' is 'full_json_file'.
-            The directory will be created if it doesn't exist.
-
-    Returns:
-        FastMCP server instance
+        mcp_server: The FastMCP server instance to register tools to
     """
-
-    @asynccontextmanager
-    async def lifespan(server: FastMCP) -> AsyncIterator[MCPState]:
-        """Initialize and cleanup MCP server state.
-
-        Args:
-            server: MCP server instance
-
-        Returns:
-            AsyncIterator yielding MCPState
-        """
-        # Initialize state
-        init_params = inspect.signature(Langfuse.__init__).parameters
-        langfuse_kwargs = {
-            "public_key": public_key,
-            "secret_key": secret_key,
-            "host": host,
-            "debug": False,  # Disable debug mode since we're only querying
-            "flush_at": 0,  # Disable automatic flushing since we're not sending data
-            "flush_interval": None,  # Disable flush interval for pull-only usage
-        }
-
-        if "tracing_enabled" in init_params:
-            langfuse_kwargs["tracing_enabled"] = False  # type: ignore[assignment]
-
-        state = MCPState(
-            langfuse_client=Langfuse(**langfuse_kwargs),
-            observation_cache=LRUCache(maxsize=cache_size),
-            file_to_observations_map=LRUCache(maxsize=cache_size),
-            exception_type_map=LRUCache(maxsize=cache_size),
-            exceptions_by_filepath=LRUCache(maxsize=cache_size),
-            dump_dir=dump_dir,
-        )
-
-        try:
-            yield state
-        finally:
-            # Cleanup
-            logger.info("Cleaning up Langfuse client")
-            state.langfuse_client.flush()
-            state.langfuse_client.shutdown()
-
-    # Create the MCP server with lifespan context manager
-    mcp = FastMCP("Langfuse MCP Server", lifespan=lifespan)
+    # Tools will access Langfuse state via Context.request_context.lifespan_context
+    # The lifespan should be set during server initialization (see init_mcp_server)
 
     # Register tools that match the Langfuse SDK signatures
-    mcp.tool()(fetch_traces)
-    mcp.tool()(fetch_trace)
-    mcp.tool()(fetch_observations)
-    mcp.tool()(fetch_observation)
-    mcp.tool()(fetch_sessions)
-    mcp.tool()(get_session_details)
-    mcp.tool()(get_user_sessions)
-    mcp.tool()(find_exceptions)
-    mcp.tool()(find_exceptions_in_file)
-    mcp.tool()(get_exception_details)
-    mcp.tool()(get_error_count)
-    mcp.tool()(get_data_schema)
-
-    return mcp
-
-
-def main():
-    """Entry point for the langfuse_mcp package."""
-    _load_env_file()
-    env_defaults = _read_env_defaults()
-    parser = _build_arg_parser(env_defaults)
-    args = parser.parse_args()
-
-    global logger
-    logger = configure_logging(args.log_level, args.log_to_console)
-    logger.info("=" * 80)
-    logger.info(f"Starting Langfuse MCP v{__version__}")
-    logger.info(f"Python executable: {sys.executable}")
-    logger.info("=" * 80)
-    logger.info(
-        "Environment defaults loaded: %s",
-        {k: ("***" if "key" in k else v) for k, v in env_defaults.items()},
+    mcp_server.add_tool(
+        Tool.from_function(
+            fetch_traces,
+            name="fetch_traces",
+            description="Find traces based on filters. Uses the Langfuse API to search for traces that match the provided filters.",
+        )
     )
-
-    # Create dump directory if it doesn't exist
-    if args.dump_dir:
-        try:
-            os.makedirs(args.dump_dir, exist_ok=True)
-            logger.info(f"Dump directory configured: {args.dump_dir}")
-        except (PermissionError, OSError) as e:
-            logger.error(f"Failed to create dump directory {args.dump_dir}: {e}")
-            args.dump_dir = None
-
-    logger.info(f"Starting MCP - host:{args.host} cache:{args.cache_size} keys:{args.public_key[:4]}.../{args.secret_key[:4]}...")
-    app = app_factory(
-        public_key=args.public_key, secret_key=args.secret_key, host=args.host, cache_size=args.cache_size, dump_dir=args.dump_dir
+    mcp_server.add_tool(
+        Tool.from_function(
+            fetch_trace,
+            name="fetch_trace",
+            description="Get a single trace by ID with full details.",
+        )
     )
-
-    app.run(transport="stdio")
-
-
-if __name__ == "__main__":
-    main()
+    mcp_server.add_tool(
+        Tool.from_function(
+            fetch_observations,
+            name="fetch_observations",
+            description="Get observations filtered by type and other criteria.",
+        )
+    )
+    mcp_server.add_tool(
+        Tool.from_function(
+            fetch_observation,
+            name="fetch_observation",
+            description="Get a single observation by ID.",
+        )
+    )
+    mcp_server.add_tool(
+        Tool.from_function(
+            fetch_sessions,
+            name="fetch_sessions",
+            description="Get a list of sessions in the current project.",
+        )
+    )
+    mcp_server.add_tool(
+        Tool.from_function(
+            get_session_details,
+            name="get_session_details",
+            description="Get detailed information about a specific session.",
+        )
+    )
+    mcp_server.add_tool(
+        Tool.from_function(
+            get_user_sessions,
+            name="get_user_sessions",
+            description="Get sessions for a user within a time range.",
+        )
+    )
+    mcp_server.add_tool(
+        Tool.from_function(
+            find_exceptions,
+            name="find_exceptions",
+            description="Get exception counts grouped by file path, function, or type.",
+        )
+    )
+    mcp_server.add_tool(
+        Tool.from_function(
+            find_exceptions_in_file,
+            name="find_exceptions_in_file",
+            description="Get detailed exception info for a specific file.",
+        )
+    )
+    mcp_server.add_tool(
+        Tool.from_function(
+            get_exception_details,
+            name="get_exception_details",
+            description="Get detailed exception info for a trace/span.",
+        )
+    )
+    mcp_server.add_tool(
+        Tool.from_function(
+            get_error_count,
+            name="get_error_count",
+            description="Get number of traces with exceptions in last N minutes.",
+        )
+    )
+    mcp_server.add_tool(
+        Tool.from_function(
+            get_data_schema,
+            name="get_data_schema",
+            description="Get schema of trace, span and event objects.",
+        )
+    )
