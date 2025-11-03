@@ -2201,12 +2201,12 @@ An observation can be a span, generation, or event within a trace.
   "input": "any",                 // Optional input data
   "output": "any",                // Optional output data
   "version": "string",            // Optional version
-  
+
   // Generation-specific fields
   "model": "string",              // LLM model name (for generations)
   "model_parameters": "object",   // Model parameters (for generations)
   "usage": "object",              // Token usage (for generations)
-  
+
   "events": [                     // Array of event objects
     {
       // Event fields (see below)
